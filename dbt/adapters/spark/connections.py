@@ -7,6 +7,11 @@ from dbt.contracts.connection import ConnectionState, AdapterResponse
 from dbt.events import AdapterLogger
 from dbt.utils import DECIMALS
 from dbt.adapters.spark import __version__
+from pyspark.rdd import _load_from_socket
+from pyspark.serializers import BatchedSerializer, PickleSerializer
+import pyspark.sql.functions as F
+from pyspark.sql import SparkSession
+
 
 try:
     from TCLIService.ttypes import TOperationState as ThriftState
@@ -153,13 +158,10 @@ class PyhiveConnectionWrapper(object):
     def __init__(self, handle):
         self.handle = handle
         self._cursor = None
-        import findspark
-        findspark.init()
-        from pyspark.sql import SparkSession
-        self.spark = SparkSession.builder.getOrCreate()
+        self.spark = SparkSession._instantiatedSession
 
     def cursor(self):
-        print("cursor")
+        #logger.debug("cursor")
         #self._cursor = self.handle.cursor()
         return self
 
@@ -189,11 +191,17 @@ class PyhiveConnectionWrapper(object):
         logger.debug("NotImplemented: rollback")
 
     def fetchall(self):
-        print("fetchall")
-        return self.result.collect()#self._cursor.fetchall()
+        logger.debug("fetchall")
+        #result = self.result.collect()#self._cursor.fetchall()
+        # sock_info = self.result._jdf.getRowsToPython(100000, -1)
+        # rows = list(_load_from_socket(sock_info, BatchedSerializer(PickleSerializer())))
+        # rows = rows[1:]
+        #rows = self.result.rdd.map(lambda row: row.asDict()).collect()
+        rows = self.result.collect()
+        logger.debug(rows)
+        return rows
 
     def execute(self, sql, bindings=None):
-        print(f"execute sql:{sql}")
         if sql.strip().endswith(";"):
             sql = sql.strip()[:-1]
 
@@ -212,11 +220,21 @@ class PyhiveConnectionWrapper(object):
         #     ThriftState.FINISHED_STATE,
         # ]
 
+        #logger.debug("HERERE")
         if bindings is not None:
             bindings = [self._fix_binding(binding) for binding in bindings]
-        print(f"bindings: {bindings}")
-        self.result = self.spark.sql(sql)
-        print(f"execute done: {self.result}")
+            #logger.debug("gen string")
+            sql = sql % tuple(bindings)
+            #logger.debug("gen okay")
+        logger.debug(f"execute sql:{sql}")
+        try:
+            self.result = self.spark.sql(sql)
+            if "show tables" in sql:
+                self.result = self.result.withColumn("description", F.lit(""))
+        except Exception as e:
+            logger.debug(f"raising error {e}")
+            dbt.exceptions.raise_database_error(e)
+        #logger.debug(f"execute done: {self.result}")
         #self._cursor.execute(sql, bindings, async_=True)
         #poll_state = self._cursor.poll()
         # state = poll_state.operationState
@@ -258,13 +276,16 @@ class PyhiveConnectionWrapper(object):
         if isinstance(value, NUMBERS):
             return float(value)
         elif isinstance(value, datetime):
-            return value.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            return "'" + value.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + "'"
+        elif isinstance(value, str):
+            return "'" + value + "'"
         else:
-            return value
+            logger.debug(type(value))
+            return "'" + str(value) + "'"
 
     @property
     def description(self):
-        print(f"description: {self.result.columns}")
+        logger.debug(f"description called returning list of columns: {self.result.columns}")
         return self.result.columns #self._cursor.description
 
 

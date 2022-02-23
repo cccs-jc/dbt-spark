@@ -126,6 +126,7 @@ class SparkAdapter(SQLAdapter):
     def list_relations_without_caching(
         self, schema_relation: SparkRelation
     ) -> List[SparkRelation]:
+        logger.debug("list_relations_without_caching")
         kwargs = {'schema_relation': schema_relation}
         try:
             results = self.execute_macro(
@@ -149,12 +150,13 @@ class SparkAdapter(SQLAdapter):
                     f'got {len(row)} values, expected 4'
                 )
             _schema, name, _, information = row
+            logger.debug(row)
             rel_type = RelationType.View \
                 if 'Type: VIEW' in information else RelationType.Table
             is_delta = 'Provider: delta' in information
             is_hudi = 'Provider: hudi' in information
             relation = self.Relation.create(
-                schema=_schema,
+                schema=schema_relation.schema,# _schema,
                 identifier=name,
                 type=rel_type,
                 information=information,
@@ -168,6 +170,7 @@ class SparkAdapter(SQLAdapter):
     def get_relation(
         self, database: str, schema: str, identifier: str
     ) -> Optional[BaseRelation]:
+        logger.debug("get_relation")
         if not self.Relation.include_policy.database:
             database = None
 
@@ -178,6 +181,7 @@ class SparkAdapter(SQLAdapter):
             relation: Relation,
             raw_rows: List[agate.Row]
     ) -> List[SparkColumn]:
+        logger.debug("parse_describe_extended")
         # Convert the Row to a dict
         dict_rows = [dict(zip(row._keys, row._values)) for row in raw_rows]
         # Find the separator between the rows and the metadata provided
@@ -217,6 +221,7 @@ class SparkAdapter(SQLAdapter):
         return pos
 
     def get_columns_in_relation(self, relation: Relation) -> List[SparkColumn]:
+        logger.debug("get_columns_in_relation")
         cached_relations = self.cache.get_relations(
             relation.database, relation.schema)
         cached_relation = next((cached_relation
@@ -328,6 +333,7 @@ class SparkAdapter(SQLAdapter):
         )
 
     def check_schema_exists(self, database, schema):
+        logger.debug("check_schema_exists")
         results = self.execute_macro(
             LIST_SCHEMAS_MACRO_NAME,
             kwargs={'database': database}
