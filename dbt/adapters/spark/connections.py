@@ -7,10 +7,12 @@ from dbt.contracts.connection import ConnectionState, AdapterResponse
 from dbt.events import AdapterLogger
 from dbt.utils import DECIMALS
 from dbt.adapters.spark import __version__
+
 from pyspark.rdd import _load_from_socket
 from pyspark.serializers import BatchedSerializer, PickleSerializer
 import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
+import sqlalchemy
 
 
 try:
@@ -60,6 +62,7 @@ class SparkConnectionMethod(StrEnum):
     THRIFT = 'thrift'
     HTTP = 'http'
     ODBC = 'odbc'
+    PYSPARK = 'pyspark'
 
 
 @dataclass
@@ -90,6 +93,8 @@ class SparkCredentials(Credentials):
         return data
 
     def __post_init__(self):
+        if self.method == SparkConnectionMethod.PYSPARK:
+            return
         # spark classifies database and schema as the same thing
         if (
             self.database is not None and
@@ -125,18 +130,18 @@ class SparkCredentials(Credentials):
                 f" using {self.method} method to connect to Spark"
             )
 
-        # if (
-        #     self.method == SparkConnectionMethod.HTTP or
-        #     self.method == SparkConnectionMethod.THRIFT
-        # ) and not (
-        #     ThriftState and THttpClient and hive
-        # ):
-        #     raise dbt.exceptions.RuntimeException(
-        #         f"{self.method} connection method requires "
-        #         "additional dependencies. \n"
-        #         "Install the additional required dependencies with "
-        #         "`pip install dbt-spark[PyHive]`"
-        #     )
+        if (
+            self.method == SparkConnectionMethod.HTTP or
+            self.method == SparkConnectionMethod.THRIFT
+        ) and not (
+            ThriftState and THttpClient and hive
+        ):
+            raise dbt.exceptions.RuntimeException(
+                f"{self.method} connection method requires "
+                "additional dependencies. \n"
+                "Install the additional required dependencies with "
+                "`pip install dbt-spark[PyHive]`"
+            )
 
     @property
     def type(self):
@@ -150,10 +155,8 @@ class SparkCredentials(Credentials):
         return ('host', 'port', 'cluster',
                 'endpoint', 'schema', 'organization')
 
-
-class PyhiveConnectionWrapper(object):
-    """Wrap a Spark connection in a way that no-ops transactions"""
-    # https://forums.databricks.com/questions/2157/in-apache-spark-sql-can-we-roll-back-the-transacti.html  # noqa
+class PysparkConnectionWrapper(object):
+    """Wrap a Spark context"""
 
     def __init__(self, handle):
         self.handle = handle
@@ -161,8 +164,6 @@ class PyhiveConnectionWrapper(object):
         self.spark = SparkSession._instantiatedSession
 
     def cursor(self):
-        #logger.debug("cursor")
-        #self._cursor = self.handle.cursor()
         return self
 
     def cancel(self):
@@ -191,12 +192,6 @@ class PyhiveConnectionWrapper(object):
         logger.debug("NotImplemented: rollback")
 
     def fetchall(self):
-        logger.debug("fetchall")
-        #result = self.result.collect()#self._cursor.fetchall()
-        # sock_info = self.result._jdf.getRowsToPython(100000, -1)
-        # rows = list(_load_from_socket(sock_info, BatchedSerializer(PickleSerializer())))
-        # rows = rows[1:]
-        #rows = self.result.rdd.map(lambda row: row.asDict()).collect()
         rows = self.result.collect()
         logger.debug(rows)
         return rows
@@ -205,27 +200,9 @@ class PyhiveConnectionWrapper(object):
         if sql.strip().endswith(";"):
             sql = sql.strip()[:-1]
 
-        # Reaching into the private enumeration here is bad form,
-        # but there doesn't appear to be any way to determine that
-        # a query has completed executing from the pyhive public API.
-        # We need to use an async query + poll here, otherwise our
-        # request may be dropped after ~5 minutes by the thrift server
-        # STATE_PENDING = [
-        #     ThriftState.INITIALIZED_STATE,
-        #     ThriftState.RUNNING_STATE,
-        #     ThriftState.PENDING_STATE,
-        # ]
-
-        # STATE_SUCCESS = [
-        #     ThriftState.FINISHED_STATE,
-        # ]
-
-        #logger.debug("HERERE")
         if bindings is not None:
             bindings = [self._fix_binding(binding) for binding in bindings]
-            #logger.debug("gen string")
             sql = sql % tuple(bindings)
-            #logger.debug("gen okay")
         logger.debug(f"execute sql:{sql}")
         try:
             self.result = self.spark.sql(sql)
@@ -234,40 +211,6 @@ class PyhiveConnectionWrapper(object):
         except Exception as e:
             logger.debug(f"raising error {e}")
             dbt.exceptions.raise_database_error(e)
-        #logger.debug(f"execute done: {self.result}")
-        #self._cursor.execute(sql, bindings, async_=True)
-        #poll_state = self._cursor.poll()
-        # state = poll_state.operationState
-
-        # while state in STATE_PENDING:
-        #     logger.debug("Poll status: {}, sleeping".format(state))
-
-        #     poll_state = self._cursor.poll()
-        #     state = poll_state.operationState
-
-        # # If an errorMessage is present, then raise a database exception
-        # # with that exact message. If no errorMessage is present, the
-        # # query did not necessarily succeed: check the state against the
-        # # known successful states, raising an error if the query did not
-        # # complete in a known good state. This can happen when queries are
-        # # cancelled, for instance. The errorMessage will be None, but the
-        # # state of the query will be "cancelled". By raising an exception
-        # # here, we prevent dbt from showing a status of OK when the query
-        # # has in fact failed.
-        # if poll_state.errorMessage:
-        #     logger.debug("Poll response: {}".format(poll_state))
-        #     logger.debug("Poll status: {}".format(state))
-        #     dbt.exceptions.raise_database_error(poll_state.errorMessage)
-
-        # elif state not in STATE_SUCCESS:
-        #     status_type = ThriftState._VALUES_TO_NAMES.get(
-        #         state,
-        #         'Unknown<{!r}>'.format(state))
-
-        #     dbt.exceptions.raise_database_error(
-        #         "Query failed with status: {}".format(status_type))
-
-        # logger.debug("Poll status: {}, query complete".format(state))
 
     @classmethod
     def _fix_binding(cls, value):
@@ -286,7 +229,124 @@ class PyhiveConnectionWrapper(object):
     @property
     def description(self):
         logger.debug(f"description called returning list of columns: {self.result.columns}")
-        return self.result.columns #self._cursor.description
+        ret = []
+        # Not sure the type is every used...
+        t = sqlalchemy.types.String
+        for c in self.result.columns:
+            ret.append((c,t))
+        return ret
+
+class PyhiveConnectionWrapper(object):
+    """Wrap a Spark connection in a way that no-ops transactions"""
+    # https://forums.databricks.com/questions/2157/in-apache-spark-sql-can-we-roll-back-the-transacti.html  # noqa
+
+    def __init__(self, handle):
+        self.handle = handle
+        self._cursor = None
+
+    def cursor(self):
+        self._cursor = self.handle.cursor()
+        return self
+
+    def cancel(self):
+        if self._cursor:
+            # Handle bad response in the pyhive lib when
+            # the connection is cancelled
+            try:
+                self._cursor.cancel()
+            except EnvironmentError as exc:
+                logger.debug(
+                    "Exception while cancelling query: {}".format(exc)
+                )
+
+    def close(self):
+        if self._cursor:
+            # Handle bad response in the pyhive lib when
+            # the connection is cancelled
+            try:
+                self._cursor.close()
+            except EnvironmentError as exc:
+                logger.debug(
+                    "Exception while closing cursor: {}".format(exc)
+                )
+        self.handle.close()
+
+    def rollback(self, *args, **kwargs):
+        logger.debug("NotImplemented: rollback")
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def execute(self, sql, bindings=None):
+        if sql.strip().endswith(";"):
+            sql = sql.strip()[:-1]
+
+        # Reaching into the private enumeration here is bad form,
+        # but there doesn't appear to be any way to determine that
+        # a query has completed executing from the pyhive public API.
+        # We need to use an async query + poll here, otherwise our
+        # request may be dropped after ~5 minutes by the thrift server
+        STATE_PENDING = [
+            ThriftState.INITIALIZED_STATE,
+            ThriftState.RUNNING_STATE,
+            ThriftState.PENDING_STATE,
+        ]
+
+        STATE_SUCCESS = [
+            ThriftState.FINISHED_STATE,
+        ]
+
+        if bindings is not None:
+            bindings = [self._fix_binding(binding) for binding in bindings]
+
+        self._cursor.execute(sql, bindings, async_=True)
+        poll_state = self._cursor.poll()
+        state = poll_state.operationState
+
+        while state in STATE_PENDING:
+            logger.debug("Poll status: {}, sleeping".format(state))
+
+            poll_state = self._cursor.poll()
+            state = poll_state.operationState
+
+        # If an errorMessage is present, then raise a database exception
+        # with that exact message. If no errorMessage is present, the
+        # query did not necessarily succeed: check the state against the
+        # known successful states, raising an error if the query did not
+        # complete in a known good state. This can happen when queries are
+        # cancelled, for instance. The errorMessage will be None, but the
+        # state of the query will be "cancelled". By raising an exception
+        # here, we prevent dbt from showing a status of OK when the query
+        # has in fact failed.
+        if poll_state.errorMessage:
+            logger.debug("Poll response: {}".format(poll_state))
+            logger.debug("Poll status: {}".format(state))
+            dbt.exceptions.raise_database_error(poll_state.errorMessage)
+
+        elif state not in STATE_SUCCESS:
+            status_type = ThriftState._VALUES_TO_NAMES.get(
+                state,
+                'Unknown<{!r}>'.format(state))
+
+            dbt.exceptions.raise_database_error(
+                "Query failed with status: {}".format(status_type))
+
+        logger.debug("Poll status: {}, query complete".format(state))
+
+    @classmethod
+    def _fix_binding(cls, value):
+        """Convert complex datatypes to primitives that can be loaded by
+           the Spark driver"""
+        if isinstance(value, NUMBERS):
+            return float(value)
+        elif isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        else:
+            return value
+
+    @property
+    def description(self):
+        return self._cursor.description
 
 
 class PyodbcConnectionWrapper(PyhiveConnectionWrapper):
@@ -374,146 +434,146 @@ class SparkConnectionManager(SQLConnectionManager):
         creds = connection.credentials
         exc = None
 
-        # for i in range(1 + creds.connect_retries):
-        #     try:
-        #         if creds.method == SparkConnectionMethod.HTTP:
-        #             cls.validate_creds(creds, ['token', 'host', 'port',
-        #                                        'cluster', 'organization'])
+        for i in range(1 + creds.connect_retries):
+            try:
+                if creds.method == SparkConnectionMethod.PYSPARK:
+                    handle = PysparkConnectionWrapper(None)
+                elif creds.method == SparkConnectionMethod.HTTP:
+                    cls.validate_creds(creds, ['token', 'host', 'port',
+                                               'cluster', 'organization'])
 
-        #             # Prepend https:// if it is missing
-        #             host = creds.host
-        #             if not host.startswith('https://'):
-        #                 host = 'https://' + creds.host
+                    # Prepend https:// if it is missing
+                    host = creds.host
+                    if not host.startswith('https://'):
+                        host = 'https://' + creds.host
 
-        #             conn_url = cls.SPARK_CONNECTION_URL.format(
-        #                 host=host,
-        #                 port=creds.port,
-        #                 organization=creds.organization,
-        #                 cluster=creds.cluster
-        #             )
+                    conn_url = cls.SPARK_CONNECTION_URL.format(
+                        host=host,
+                        port=creds.port,
+                        organization=creds.organization,
+                        cluster=creds.cluster
+                    )
 
-        #             logger.debug("connection url: {}".format(conn_url))
+                    logger.debug("connection url: {}".format(conn_url))
 
-        #             transport = THttpClient.THttpClient(conn_url)
+                    transport = THttpClient.THttpClient(conn_url)
 
-        #             raw_token = "token:{}".format(creds.token).encode()
-        #             token = base64.standard_b64encode(raw_token).decode()
-        #             transport.setCustomHeaders({
-        #                 'Authorization': 'Basic {}'.format(token)
-        #             })
+                    raw_token = "token:{}".format(creds.token).encode()
+                    token = base64.standard_b64encode(raw_token).decode()
+                    transport.setCustomHeaders({
+                        'Authorization': 'Basic {}'.format(token)
+                    })
 
-        #             conn = hive.connect(thrift_transport=transport)
-        #             handle = PyhiveConnectionWrapper(conn)
-        #         elif creds.method == SparkConnectionMethod.THRIFT:
-        #             cls.validate_creds(creds,
-        #                                ['host', 'port', 'user', 'schema'])
+                    conn = hive.connect(thrift_transport=transport)
+                    handle = PyhiveConnectionWrapper(conn)
+                elif creds.method == SparkConnectionMethod.THRIFT:
+                    cls.validate_creds(creds,
+                                       ['host', 'port', 'user', 'schema'])
 
-        #             if creds.use_ssl:
-        #                 transport = build_ssl_transport(
-        #                     host=creds.host,
-        #                     port=creds.port,
-        #                     username=creds.user,
-        #                     auth=creds.auth,
-        #                     kerberos_service_name=creds.kerberos_service_name)
-        #                 conn = hive.connect(thrift_transport=transport)
-        #             else:
-        #                 conn = hive.connect(host=creds.host,
-        #                                     port=creds.port,
-        #                                     username=creds.user,
-        #                                     auth=creds.auth,
-        #                                     kerberos_service_name=creds.kerberos_service_name)  # noqa
-        #             handle = PyhiveConnectionWrapper(conn)
-        #         elif creds.method == SparkConnectionMethod.ODBC:
-        #             if creds.cluster is not None:
-        #                 required_fields = ['driver', 'host', 'port', 'token',
-        #                                    'organization', 'cluster']
-        #                 http_path = cls.SPARK_CLUSTER_HTTP_PATH.format(
-        #                     organization=creds.organization,
-        #                     cluster=creds.cluster
-        #                 )
-        #             elif creds.endpoint is not None:
-        #                 required_fields = ['driver', 'host', 'port', 'token',
-        #                                    'endpoint']
-        #                 http_path = cls.SPARK_SQL_ENDPOINT_HTTP_PATH.format(
-        #                     endpoint=creds.endpoint
-        #                 )
-        #             else:
-        #                 raise dbt.exceptions.DbtProfileError(
-        #                     "Either `cluster` or `endpoint` must set when"
-        #                     " using the odbc method to connect to Spark"
-        #                 )
+                    if creds.use_ssl:
+                        transport = build_ssl_transport(
+                            host=creds.host,
+                            port=creds.port,
+                            username=creds.user,
+                            auth=creds.auth,
+                            kerberos_service_name=creds.kerberos_service_name)
+                        conn = hive.connect(thrift_transport=transport)
+                    else:
+                        conn = hive.connect(host=creds.host,
+                                            port=creds.port,
+                                            username=creds.user,
+                                            auth=creds.auth,
+                                            kerberos_service_name=creds.kerberos_service_name)  # noqa
+                    handle = PyhiveConnectionWrapper(conn)
+                elif creds.method == SparkConnectionMethod.ODBC:
+                    if creds.cluster is not None:
+                        required_fields = ['driver', 'host', 'port', 'token',
+                                           'organization', 'cluster']
+                        http_path = cls.SPARK_CLUSTER_HTTP_PATH.format(
+                            organization=creds.organization,
+                            cluster=creds.cluster
+                        )
+                    elif creds.endpoint is not None:
+                        required_fields = ['driver', 'host', 'port', 'token',
+                                           'endpoint']
+                        http_path = cls.SPARK_SQL_ENDPOINT_HTTP_PATH.format(
+                            endpoint=creds.endpoint
+                        )
+                    else:
+                        raise dbt.exceptions.DbtProfileError(
+                            "Either `cluster` or `endpoint` must set when"
+                            " using the odbc method to connect to Spark"
+                        )
 
-        #             cls.validate_creds(creds, required_fields)
+                    cls.validate_creds(creds, required_fields)
 
-        #             dbt_spark_version = __version__.version
-        #             user_agent_entry = f"fishtown-analytics-dbt-spark/{dbt_spark_version} (Databricks)"  # noqa
+                    dbt_spark_version = __version__.version
+                    user_agent_entry = f"dbt-labs-dbt-spark/{dbt_spark_version} (Databricks)"  # noqa
 
-        #             # http://simba.wpengine.com/products/Spark/doc/ODBC_InstallGuide/unix/content/odbc/hi/configuring/serverside.htm
-        #             ssp = {
-        #                 f"SSP_{k}": f"{{{v}}}"
-        #                 for k, v in creds.server_side_parameters.items()
-        #             }
+                    # http://simba.wpengine.com/products/Spark/doc/ODBC_InstallGuide/unix/content/odbc/hi/configuring/serverside.htm
+                    ssp = {
+                        f"SSP_{k}": f"{{{v}}}"
+                        for k, v in creds.server_side_parameters.items()
+                    }
 
-        #             # https://www.simba.com/products/Spark/doc/v2/ODBC_InstallGuide/unix/content/odbc/options/driver.htm
-        #             connection_str = _build_odbc_connnection_string(
-        #                 DRIVER=creds.driver,
-        #                 HOST=creds.host,
-        #                 PORT=creds.port,
-        #                 UID="token",
-        #                 PWD=creds.token,
-        #                 HTTPPath=http_path,
-        #                 AuthMech=3,
-        #                 SparkServerType=3,
-        #                 ThriftTransport=2,
-        #                 SSL=1,
-        #                 UserAgentEntry=user_agent_entry,
-        #                 LCaseSspKeyName=0 if ssp else 1,
-        #                 **ssp,
-        #             )
+                    # https://www.simba.com/products/Spark/doc/v2/ODBC_InstallGuide/unix/content/odbc/options/driver.htm
+                    connection_str = _build_odbc_connnection_string(
+                        DRIVER=creds.driver,
+                        HOST=creds.host,
+                        PORT=creds.port,
+                        UID="token",
+                        PWD=creds.token,
+                        HTTPPath=http_path,
+                        AuthMech=3,
+                        SparkServerType=3,
+                        ThriftTransport=2,
+                        SSL=1,
+                        UserAgentEntry=user_agent_entry,
+                        LCaseSspKeyName=0 if ssp else 1,
+                        **ssp,
+                    )
 
-        #             conn = pyodbc.connect(connection_str, autocommit=True)
-        #             handle = PyodbcConnectionWrapper(conn)
-        #         else:
-        #             raise dbt.exceptions.DbtProfileError(
-        #                 f"invalid credential method: {creds.method}"
-        #             )
-        #         break
-        #     except Exception as e:
-        #         exc = e
-        #         if isinstance(e, EOFError):
-        #             # The user almost certainly has invalid credentials.
-        #             # Perhaps a token expired, or something
-        #             msg = 'Failed to connect'
-        #             if creds.token is not None:
-        #                 msg += ', is your token valid?'
-        #             raise dbt.exceptions.FailedToConnectException(msg) from e
-        #         retryable_message = _is_retryable_error(e)
-        #         if retryable_message and creds.connect_retries > 0:
-        #             msg = (
-        #                 f"Warning: {retryable_message}\n\tRetrying in "
-        #                 f"{creds.connect_timeout} seconds "
-        #                 f"({i} of {creds.connect_retries})"
-        #             )
-        #             logger.warning(msg)
-        #             time.sleep(creds.connect_timeout)
-        #         elif creds.retry_all and creds.connect_retries > 0:
-        #             msg = (
-        #                 f"Warning: {getattr(exc, 'message', 'No message')}, "
-        #                 f"retrying due to 'retry_all' configuration "
-        #                 f"set to true.\n\tRetrying in "
-        #                 f"{creds.connect_timeout} seconds "
-        #                 f"({i} of {creds.connect_retries})"
-        #             )
-        #             logger.warning(msg)
-        #             time.sleep(creds.connect_timeout)
-        #         else:
-        #             raise dbt.exceptions.FailedToConnectException(
-        #                 'failed to connect'
-        #             ) from e
-        # else:
-        #     raise exc
-
-        handle = PyhiveConnectionWrapper(None)
+                    conn = pyodbc.connect(connection_str, autocommit=True)
+                    handle = PyodbcConnectionWrapper(conn)
+                else:
+                    raise dbt.exceptions.DbtProfileError(
+                        f"invalid credential method: {creds.method}"
+                    )
+                break
+            except Exception as e:
+                exc = e
+                if isinstance(e, EOFError):
+                    # The user almost certainly has invalid credentials.
+                    # Perhaps a token expired, or something
+                    msg = 'Failed to connect'
+                    if creds.token is not None:
+                        msg += ', is your token valid?'
+                    raise dbt.exceptions.FailedToConnectException(msg) from e
+                retryable_message = _is_retryable_error(e)
+                if retryable_message and creds.connect_retries > 0:
+                    msg = (
+                        f"Warning: {retryable_message}\n\tRetrying in "
+                        f"{creds.connect_timeout} seconds "
+                        f"({i} of {creds.connect_retries})"
+                    )
+                    logger.warning(msg)
+                    time.sleep(creds.connect_timeout)
+                elif creds.retry_all and creds.connect_retries > 0:
+                    msg = (
+                        f"Warning: {getattr(exc, 'message', 'No message')}, "
+                        f"retrying due to 'retry_all' configuration "
+                        f"set to true.\n\tRetrying in "
+                        f"{creds.connect_timeout} seconds "
+                        f"({i} of {creds.connect_retries})"
+                    )
+                    logger.warning(msg)
+                    time.sleep(creds.connect_timeout)
+                else:
+                    raise dbt.exceptions.FailedToConnectException(
+                        'failed to connect'
+                    ) from e
+        else:
+            raise exc
 
         connection.handle = handle
         connection.state = ConnectionState.OPEN
@@ -573,3 +633,11 @@ def _is_retryable_error(exc: Exception) -> Optional[str]:
     if 'temporarily_unavailable' in message:
         return exc.message
     return None
+    
+
+
+
+
+
+
+
