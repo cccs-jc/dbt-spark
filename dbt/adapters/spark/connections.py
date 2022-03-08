@@ -13,7 +13,7 @@ from pyspark.serializers import BatchedSerializer, PickleSerializer
 import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
 import sqlalchemy
-
+import re
 
 try:
     from TCLIService.ttypes import TOperationState as ThriftState
@@ -199,6 +199,10 @@ class PysparkConnectionWrapper(object):
     def execute(self, sql, bindings=None):
         if sql.strip().endswith(";"):
             sql = sql.strip()[:-1]
+
+        # remove comment line, iceberg procedure do not accept comments.
+        # reported here https://github.com/apache/iceberg/issues/4289
+        sql = re.sub(r'/\*.*\*/', '', sql)
 
         if bindings is not None:
             bindings = [self._fix_binding(binding) for binding in bindings]
