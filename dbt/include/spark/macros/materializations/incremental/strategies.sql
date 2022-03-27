@@ -55,7 +55,7 @@
     {#-- insert statements don't like CTEs, so support them via a temp view #}
     {{ get_insert_overwrite_sql(source, target) }}
   {%- elif strategy == 'merge' -%}
-  {#-- merge all columns with databricks delta - schema changes are handled for us #}
+  {#-- merge all columns with databricks delta or iceberg- schema changes are handled for us #}
     {{ get_merge_sql(target, source, unique_key, dest_columns=none, predicates=none) }}
   {%- else -%}
     {% set no_sql_for_strategy_msg -%}

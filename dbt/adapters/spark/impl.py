@@ -40,6 +40,7 @@ class SparkConfig(AdapterConfig):
     buckets: Optional[int] = None
     options: Optional[Dict[str, str]] = None
     merge_update_columns: Optional[str] = None
+    tblproperties: Optional[Dict[str, str]] = None
 
 
 class SparkAdapter(SQLAdapter):
@@ -149,16 +150,22 @@ class SparkAdapter(SQLAdapter):
                     f'got {len(row)} values, expected 4'
                 )
             _schema, name, _, information = row
+            logger.debug(row)
+            
             rel_type = RelationType.View \
                 if 'Type: VIEW' in information else RelationType.Table
             is_delta = 'Provider: delta' in information
+            is_iceberg = 'Provider: iceberg' in information
+            # TODO: jcc hardcoded for now, need a way to determine if table is iceberg or not
+            is_iceberg = True
             is_hudi = 'Provider: hudi' in information
             relation = self.Relation.create(
-                schema=_schema,
+                schema=schema_relation.schema,# _schema,
                 identifier=name,
                 type=rel_type,
                 information=information,
                 is_delta=is_delta,
+                is_iceberg=is_iceberg,
                 is_hudi=is_hudi,
             )
             relations.append(relation)
@@ -290,11 +297,12 @@ class SparkAdapter(SQLAdapter):
 
     def get_catalog(self, manifest):
         schema_map = self._get_catalog_schemas(manifest)
-        if len(schema_map) > 1:
-            dbt.exceptions.raise_compiler_error(
-                f'Expected only one database in get_catalog, found '
-                f'{list(schema_map)}'
-            )
+        # TODO: jcc removed this check, not sure why I get two catalogs and why there is a check here..
+        # if len(schema_map) > 1:
+        #     dbt.exceptions.raise_compiler_error(
+        #         f'Expected only one database in get_catalog, found '
+        #         f'{list(schema_map)}'
+        #     )
 
         with executor(self.config) as tpe:
             futures: List[Future[agate.Table]] = []

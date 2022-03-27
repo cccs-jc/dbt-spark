@@ -1,3 +1,15 @@
+{% macro dbt_spark_tblproperties_clause() -%}
+  {%- set tblproperties = config.get('tblproperties') -%}
+  {%- if tblproperties is not none %}
+    tblproperties (
+      {%- for prop in tblproperties -%}
+      '{{ prop }}' = '{{ tblproperties[prop] }}' {% if not loop.last %}, {% endif %}
+      {%- endfor %}
+    )
+  {%- endif %}
+{%- endmacro -%}
+
+
 {% macro file_format_clause() %}
   {%- set file_format = config.get('file_format', validator=validation.any[basestring]) -%}
   {%- if file_format is not none %}
@@ -100,6 +112,8 @@
   {%- else -%}
     {% if config.get('file_format', validator=validation.any[basestring]) == 'delta' %}
       create or replace table {{ relation }}
+    {% elif config.get('file_format', validator=validation.any[basestring]) == 'iceberg' %}
+      create or replace table {{ relation }}
     {% else %}
       create table {{ relation }}
     {% endif %}
@@ -107,6 +121,7 @@
     {{ options_clause() }}
     {{ partition_cols(label="partitioned by") }}
     {{ clustered_cols(label="clustered by") }}
+    {{ dbt_spark_tblproperties_clause() }}
     {{ location_clause() }}
     {{ comment_clause() }}
     as
@@ -143,7 +158,7 @@
 
 {% macro spark__list_relations_without_caching(relation) %}
   {% call statement('list_relations_without_caching', fetch_result=True) -%}
-    show table extended in {{ relation }} like '*'
+    show tables in {{ relation }} like '*'
   {% endcall %}
 
   {% do return(load_result('list_relations_without_caching').table) %}
@@ -192,12 +207,13 @@
 {% endmacro %}
 
 {% macro spark__alter_column_comment(relation, column_dict) %}
-  {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'hudi'] %}
+  {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg', 'hudi'] %}
     {% for column_name in column_dict %}
       {% set comment = column_dict[column_name]['description'] %}
       {% set escaped_comment = comment | replace('\'', '\\\'') %}
+      {# TODO: jcc hardcoded iceberg sematic here #}
       {% set comment_query %}
-        alter table {{ relation }} change column 
+        alter table {{ relation }} alter column 
             {{ adapter.quote(column_name) if column_dict[column_name]['quote'] else column_name }}
             comment '{{ escaped_comment }}';
       {% endset %}
@@ -205,7 +221,6 @@
     {% endfor %}
   {% endif %}
 {% endmacro %}
-
 
 {% macro spark__make_temp_relation(base_relation, suffix) %}
     {% set tmp_identifier = base_relation.identifier ~ suffix %}
@@ -229,6 +244,11 @@
   
   {% if remove_columns %}
     {% set platform_name = 'Delta Lake' if relation.is_delta else 'Apache Spark' %}
+    {{ exceptions.raise_compiler_error(platform_name + ' does not support dropping columns from tables') }}
+  {% endif %}
+
+  {% if remove_columns %}
+    {% set platform_name = 'Iceberg' if relation.is_iceberg else 'Apache Spark' %}
     {{ exceptions.raise_compiler_error(platform_name + ' does not support dropping columns from tables') }}
   {% endif %}
   
