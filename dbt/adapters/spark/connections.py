@@ -8,6 +8,13 @@ from dbt.events import AdapterLogger
 from dbt.utils import DECIMALS
 from dbt.adapters.spark import __version__
 
+from pyspark.rdd import _load_from_socket
+from pyspark.serializers import BatchedSerializer, PickleSerializer
+import pyspark.sql.functions as F
+from pyspark.sql import SparkSession
+import sqlalchemy
+import re
+
 try:
     from pyspark.rdd import _load_from_socket
     import pyspark.sql.functions as F
@@ -229,7 +236,6 @@ class PysparkConnectionWrapper(object):
             bindings = [self._fix_binding(binding) for binding in bindings]
             sql = sql % tuple(bindings)
         logger.debug(f"execute sql:{sql}")
-
         try:
             self.result = self.spark.sql(sql)
             logger.debug("Executed with no errors")
@@ -262,7 +268,6 @@ class PysparkConnectionWrapper(object):
         for c in self.result.columns:
             ret.append((c,t))
         return ret
-
 
 class PyhiveConnectionWrapper(object):
     """Wrap a Spark connection in a way that no-ops transactions"""
